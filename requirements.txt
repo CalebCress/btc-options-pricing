@@ -1,0 +1,12 @@
+numpy
+pandas
+scipy
+pyarrow
+torch
+xgboost
+lightgbm
+scikit-learn
+hmmlearn
+tardis-dev
+matplotlib
+jupyter
