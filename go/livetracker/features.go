@@ -64,6 +64,26 @@ const (
 	fVPIN
 	fKylesLambda
 
+	// Regime Tier 1 (3 features, from buy_ratio)
+	fMicropriceDivergence
+	fOBImbalanceVelocity
+	fTradeArrivalAsymmetry
+
+	// Regime Tier 2 (4 features)
+	fVarianceRatio
+	fHurst
+	fAutocorrLag1
+	fVPINRoC5m
+
+	// HMM posteriors (4 features)
+	fHMMProbBull
+	fHMMProbBear
+	fHMMProbCalm
+	fHMMProbTransition
+
+	// Composite regime score (1 feature)
+	fRegimeScore
+
 	// Prices (3, used internally and by model)
 	fSpotClose
 	fPerpClose
@@ -74,7 +94,7 @@ const (
 	fXGBUncertainty
 	fBSImpliedProb
 
-	numFeatureSlots // must equal NumFeatures (76)
+	numFeatureSlots // must equal NumFeatures (60)
 )
 
 // featureNames maps indices to human-readable names.
@@ -106,6 +126,17 @@ var featureNames = [NumFeatures]string{
 	fTradeCountZScore: "trade_count_zscore", fVolumeZScore: "volume_zscore",
 	fBuyRatio: "buy_ratio",
 	fVPIN: "vpin", fKylesLambda: "kyles_lambda",
+
+	fMicropriceDivergence: "microprice_div", fOBImbalanceVelocity: "ob_imbalance_velocity",
+	fTradeArrivalAsymmetry: "trade_arrival_asymmetry",
+
+	fVarianceRatio: "variance_ratio", fHurst: "hurst",
+	fAutocorrLag1: "autocorr_lag1", fVPINRoC5m: "vpin_roc_5m",
+
+	fHMMProbBull: "hmm_prob_bull", fHMMProbBear: "hmm_prob_bear",
+	fHMMProbCalm: "hmm_prob_calm", fHMMProbTransition: "hmm_prob_transition",
+
+	fRegimeScore: "regime_score",
 
 	fSpotClose: "spot_close", fPerpClose: "perp_close", fLogReturn1m: "log_return_1m",
 
@@ -219,9 +250,22 @@ type FeatureComputer struct {
 	vpin *VPINCalculator
 
 	// Kyle's Lambda
-	logRetBuf   *RingBuffer
+	logRetBuf    *RingBuffer
 	signedVolBuf *RingBuffer
-	kylesWindow int
+	kylesWindow  int
+
+	// Regime Tier 1
+	prevBuyRatio float64 // for ob_imbalance_velocity
+	buyRatioAvg  *RollingSum // 10-bar rolling average for trade_arrival_asymmetry
+
+	// Regime Tier 2
+	regime *RegimeComputer
+
+	// Regime Tier 3 (HMM)
+	hmm *HMMPredictor // nil if no HMM params loaded
+
+	// VPIN diff for vpin_roc_5m
+	vpinDiff *DiffBuffer
 
 	// Sequence buffer (60 bars × NumFeatures)
 	seqBuf   *RingBuffer // stores flat features; each "element" is actually a bar index
@@ -230,7 +274,7 @@ type FeatureComputer struct {
 	seqCount int
 
 	// Current feature values
-	current [NumFeatures]float64
+	current  [NumFeatures]float64
 	barCount int
 }
 
@@ -272,8 +316,24 @@ func NewFeatureComputer(cfg Config) *FeatureComputer {
 		signedVolBuf: NewRingBuffer(60),
 		kylesWindow:  60,
 
-		seqSlots:  make([][NumFeatures]float64, cfg.SequenceLength),
+		// Regime Tier 1
+		prevBuyRatio: math.NaN(),
+		buyRatioAvg:  NewRollingSum(10),
+
+		// Regime Tier 2
+		regime: NewRegimeComputer(cfg.VarianceRatioQ, cfg.VarianceRatioWindow,
+			cfg.HurstWindow, cfg.AutocorrWindow),
+
+		// VPIN rate of change
+		vpinDiff: NewDiffBuffer(5),
+
+		seqSlots:     make([][NumFeatures]float64, cfg.SequenceLength),
 		prevSecClose: math.NaN(),
+	}
+
+	// HMM (nil if no params provided)
+	if cfg.HMMParams != nil {
+		fc.hmm = NewHMMPredictor(*cfg.HMMParams)
 	}
 
 	// Initialize realized moment buffers for each window
@@ -360,6 +420,59 @@ func (fc *FeatureComputer) OnSpotBar(b Bar) {
 
 	// Update basis if we have perp data
 	fc.updateBasis()
+
+	// --- Regime Tier 1 (from buy_ratio) ---
+	buyRatio := fc.current[fBuyRatio]
+	if !math.IsNaN(buyRatio) {
+		// Microprice divergence: buy_ratio - 0.5
+		fc.current[fMicropriceDivergence] = buyRatio - 0.5
+
+		// OB imbalance velocity: diff of buy_ratio
+		if !math.IsNaN(fc.prevBuyRatio) {
+			fc.current[fOBImbalanceVelocity] = buyRatio - fc.prevBuyRatio
+		}
+		fc.prevBuyRatio = buyRatio
+
+		// Trade arrival asymmetry: 10-bar rolling mean of buy_ratio - 0.5
+		fc.buyRatioAvg.Push(buyRatio)
+		if fc.buyRatioAvg.Len() > 0 {
+			fc.current[fTradeArrivalAsymmetry] = fc.buyRatioAvg.Sum()/float64(fc.buyRatioAvg.Len()) - 0.5
+		}
+	}
+
+	// --- Regime Tier 2 (from log returns) ---
+	logRet := fc.current[fLogReturn1m]
+	fc.regime.Push(logRet)
+	fc.current[fVarianceRatio] = fc.regime.VarianceRatio()
+	fc.current[fHurst] = fc.regime.Hurst()
+	fc.current[fAutocorrLag1] = fc.regime.AutocorrLag1()
+
+	// VPIN rate of change
+	vpinVal := fc.current[fVPIN]
+	if !math.IsNaN(vpinVal) {
+		fc.vpinDiff.Push(vpinVal)
+		fc.current[fVPINRoC5m] = fc.vpinDiff.Diff(5)
+	}
+
+	// --- Regime Tier 3 (HMM) ---
+	if fc.hmm != nil {
+		obs := []float64{
+			logRet,
+			fc.current[fRV5m],
+			fc.current[fSpotTOFI5m],
+			fc.current[fPerpTOFI5m],
+			fc.current[fBasisMomentum5m],
+		}
+		fc.hmm.Observe(obs)
+		post := fc.hmm.Posteriors()
+		fc.current[fHMMProbBull] = post[0]
+		fc.current[fHMMProbBear] = post[1]
+		fc.current[fHMMProbCalm] = post[2]
+		fc.current[fHMMProbTransition] = post[3]
+	}
+
+	// --- Composite regime score ---
+	fc.current[fRegimeScore] = fc.computeRegimeScore()
 
 	// Store in sequence buffer
 	fc.pushSequence()
@@ -545,6 +658,37 @@ func (fc *FeatureComputer) pushSequence() {
 		fc.seqCount++
 	}
 	fc.barCount++
+}
+
+func (fc *FeatureComputer) computeRegimeScore() float64 {
+	// Composite: 0.25*(VR-1) + 0.25*(2*H-1) + 0.25*hmm_trend + 0.25*autocorr
+	vr := fc.current[fVarianceRatio]
+	h := fc.current[fHurst]
+	ac := fc.current[fAutocorrLag1]
+
+	vrSignal := 0.0
+	if !math.IsNaN(vr) {
+		vrSignal = math.Max(-1, math.Min(1, vr-1))
+	}
+	hurstSignal := 0.0
+	if !math.IsNaN(h) {
+		hurstSignal = math.Max(-1, math.Min(1, (h-0.5)*2))
+	}
+	acSignal := 0.0
+	if !math.IsNaN(ac) {
+		acSignal = math.Max(-1, math.Min(1, ac))
+	}
+
+	// HMM trend: P(bull) + P(bear) - P(calm) - P(transition)
+	// Both trending states (regardless of direction) contribute positively
+	hmmTrend := 0.0
+	if fc.hmm != nil {
+		hmmTrend = fc.current[fHMMProbBull] + fc.current[fHMMProbBear] -
+			fc.current[fHMMProbCalm] - fc.current[fHMMProbTransition]
+	}
+
+	score := 0.25*vrSignal + 0.25*hurstSignal + 0.25*hmmTrend + 0.25*acSignal
+	return math.Max(-1, math.Min(1, score))
 }
 
 func (fc *FeatureComputer) computeKylesLambda() float64 {

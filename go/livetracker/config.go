@@ -34,6 +34,16 @@ type Config struct {
 
 	// StaleThreshold is how long before a prediction is marked stale.
 	StaleThreshold time.Duration
+
+	// Regime detection parameters.
+	VarianceRatioQ      int
+	VarianceRatioWindow int
+	HurstWindow         int
+	AutocorrWindow      int
+	HMMNStates          int
+
+	// HMMParams are the pre-trained HMM parameters (nil if no HMM).
+	HMMParams *HMMParams
 }
 
 // DefaultConfig returns configuration matching the Python config.py.
@@ -50,5 +60,11 @@ func DefaultConfig() Config {
 		VPINNumBuckets:       50,
 		FundingZScoreWindow:  10080,
 		StaleThreshold:       2 * time.Minute,
+
+		VarianceRatioQ:      5,
+		VarianceRatioWindow: 60,
+		HurstWindow:         60,
+		AutocorrWindow:      30,
+		HMMNStates:          4,
 	}
 }

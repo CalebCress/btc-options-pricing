@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 # --- Model Definition (must match training code) ---
 
 SEQ_LEN = 60
-N_FEATURES = 48
+N_FEATURES = 60
 HIDDEN_DIM = 128
 N_LAYERS = 2
 K = 4  # mixture components

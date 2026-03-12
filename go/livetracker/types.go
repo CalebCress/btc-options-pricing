@@ -52,8 +52,9 @@ type LiquidationUpdate struct {
 
 // NumFeatures is the total number of features in the feature vector.
 // 9 TOFI + 6 basis + 7 funding/OI + 6 realized moments + 6 HAR-RV +
-// 3 spread + 3 trade intensity + 2 VPIN/Kyle + 3 prices + 3 XGBoost = 48
-const NumFeatures = 48
+// 3 spread + 3 trade intensity + 2 VPIN/Kyle + 3 tier1 regime +
+// 4 tier2 regime + 4 HMM posteriors + 1 regime score + 3 prices + 3 XGBoost = 60
+const NumFeatures = 60
 
 // PriceTarget holds the latest model prediction.
 type PriceTarget struct {
