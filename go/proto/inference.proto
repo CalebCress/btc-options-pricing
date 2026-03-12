@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package inference;
+
+option go_package = "github.com/CalebCress/btc-options-pricing/go/proto";
+
+service InferenceService {
+    // Predict takes a sequence of feature vectors and returns mixture params + calibrated probability.
+    rpc Predict(PredictRequest) returns (PredictResponse);
+}
+
+message PredictRequest {
+    // Flat array of features: [seq_len * n_features] = [60 * 48] = 2880 floats.
+    repeated float features = 1;
+    // Timestamp of the latest bar in microseconds since epoch.
+    int64 timestamp_us = 2;
+}
+
+message PredictResponse {
+    // Student-t mixture parameters (K=4 components).
+    repeated float pi = 1;
+    repeated float mu = 2;
+    repeated float sigma = 3;
+    repeated float nu = 4;
+    // Calibrated P(return > 0 in next 15 minutes).
+    float prob_up = 5;
+    // XGBoost-derived features (fed back into feature vector for next bar).
+    float xgb_prob = 6;
+    float xgb_uncertainty = 7;
+    float bs_implied_prob = 8;
+}
